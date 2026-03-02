@@ -1,4 +1,6 @@
-github-feed
-github.db
+gitlab-feed
+gitlab.db
 gitai
 gitai.db
+.env
+git-feed

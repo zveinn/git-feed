@@ -4,395 +4,337 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GitHub Feed is a Go CLI tool for monitoring GitHub pull requests and issues across repositories. It tracks contributions, reviews, and assignments with colorized output and real-time progress visualization.
+Git Feed is a Go CLI for monitoring:
+- GitHub pull requests and issues
+- GitLab merge requests and issues
 
-The tool is also called "GitAI" in the README (branding name), but the binary is `github-feed`.
+The README uses the branding name "GitAI", but the binary is `git-feed`.
+
+This repo is the unified (GitHub + GitLab) version. Avoid adding documentation that assumes GitHub-only behavior.
 
 ## Build & Run
 
 ```bash
-# Build the binary
-go build -o github-feed .
+go build -o git-feed .
 
-# Run directly (fetches from GitHub API)
-./github-feed
+# Default: GitHub platform, online mode
+./git-feed
 
-# Run with flags
-./github-feed --time 3h        # Show items from last 3 hours
-./github-feed --time 2d        # Show items from last 2 days
-./github-feed --time 3w        # Show items from last 3 weeks
-./github-feed --time 6m        # Show items from last 6 months (default: 1m)
-./github-feed --time 1y        # Show items from last year
-./github-feed --debug          # Show detailed API logging instead of progress bar
-./github-feed --local          # Use local database instead of GitHub API (offline mode)
-./github-feed --links          # Show hyperlinks underneath each PR/issue
-./github-feed --ll             # Shortcut for --local --links (offline mode with links)
-./github-feed --clean          # Delete and recreate the database cache
-./github-feed --allowed-repos="owner/repo1,owner/repo2"  # Filter to specific repos
+# Select platform
+./git-feed --platform github
+./git-feed --platform gitlab
+
+# Time window (default: 1m)
+./git-feed --time 3h
+./git-feed --time 2d
+./git-feed --time 3w
+./git-feed --time 6m
+./git-feed --time 1y
+
+# Debug output (verbose logging)
+./git-feed --debug
+
+# Offline mode: read from local cache DB only
+./git-feed --local
+
+# Show hyperlinks under each MR/PR/issue
+./git-feed --links
+
+# Shortcut: --local --links
+./git-feed --ll
+
+# Delete and recreate the cache DB for the selected platform
+./git-feed --clean
+
+# Restrict to a bounded set of repos/projects
+./git-feed --allowed-repos "owner/repo,owner/other"
+./git-feed --platform gitlab --allowed-repos "group/repo,group/subgroup/repo"
 ```
 
 ## Configuration
 
-The tool requires a GitHub Personal Access Token with `repo` and `read:org` scopes (not needed in `--local` mode). Configuration is loaded from:
-1. Environment variables: `GITHUB_TOKEN` or `GITHUB_ACTIVITY_TOKEN`, and `GITHUB_USERNAME` or `GITHUB_USER`
-2. Config file at `~/.github-feed/.env` (automatically created on first run)
+Select the platform via `--platform github|gitlab` (default: `github`).
 
-Database location: `~/.github-feed/github.db` (automatically created on first run)
+Online mode requirements depend on platform:
 
-**First Run**: The tool automatically creates `~/.github-feed/` directory with:
-- `.env` file with template for credentials (permissions: 0600)
-- `github.db` database for caching GitHub data (permissions: 0666)
-- Directory permissions: 0755
+- GitHub: `GITHUB_TOKEN`, `GITHUB_USERNAME` (and optionally `GITHUB_ALLOWED_REPOS`)
+- GitLab: `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`) and `GITLAB_ALLOWED_REPOS`
+
+Precedence order:
+1) CLI flags
+2) Environment variables
+3) Shared `.env` file
+4) Built-in defaults
+
+The `.env` file is auto-created on first run at:
+- `~/.git-feed/.env`
+
+Important: `.env` loading does not override already-set environment variables.
+
+Environment variables:
+- GitHub
+  - `GITHUB_TOKEN` (required online)
+  - `GITHUB_USERNAME` (required online)
+  - `GITHUB_ALLOWED_REPOS` (optional; comma-separated `owner/repo`)
+
+- GitLab
+  - `GITLAB_TOKEN` or `GITLAB_ACTIVITY_TOKEN` (required online)
+  - `GITLAB_HOST` (optional host override; takes precedence over `GITLAB_BASE_URL`)
+  - `GITLAB_BASE_URL` (optional; default: `https://gitlab.com`)
+  - `GITLAB_ALLOWED_REPOS` (required online; comma-separated `group[/subgroup]/repo`)
+  - `ALLOWED_REPOS` (legacy fallback for either platform when platform-specific vars are unset)
+  - `GITLAB_USERNAME` or `GITLAB_USER` (documented in help/template, but the current code resolves the GitLab user via API and does not read these vars)
+
+Token scopes:
+- `read_api` (recommended)
+- `api` only if your self-managed instance requires broader scope
+
+Reference: https://docs.gitlab.com/user/profile/personal_access_tokens/
+
+Database cache:
+- GitHub: `~/.git-feed/github.db` (BBolt)
+- GitLab: `~/.git-feed/gitlab.db` (BBolt)
+
+Notes:
+- The tool uses a platform-specific database file (based on `--platform`). Both files share the same on-disk schema.
+- You will only see both `github.db` and `gitlab.db` after running the tool at least once for each platform.
+
+## First Run Behavior
+
+On first run the app creates `~/.git-feed/` (permissions: 0755) and ensures:
+- `~/.git-feed/.env` exists (permissions: 0600)
+- The platform database exists (permissions: 0666)
+
+The `.env` file contains a template with both GitHub and GitLab variables.
 
 ## Architecture & Key Components
 
+This repo is organized as a single CLI entrypoint (`main.go`) that dispatches to one of two platform implementations:
+- `platform_github.go` (GitHub)
+- `platform_gitlab.go` (GitLab)
+
+Both platforms share:
+- common models (`MergeRequestModel`, `IssueModel`) used for display
+- label priority logic (`shouldUpdateLabel`) and its tests
+- a BBolt cache (`db.go`) used for offline mode and persistence
+
 ### Data Flow
 
-#### Online Mode (Default)
-1. **Parallel API Fetching**: Six concurrent GitHub search queries for PRs (authored, mentioned, assigned, commented, reviewed, review-requested) - note: no "involved" query exists
-2. **Issue Collection**: Four parallel searches for issues (authored, mentioned, assigned, commented)
-3. **Database Caching** (db.go): All fetched PRs, issues, and comments are automatically saved to `~/.github-feed/github.db` BBolt database
-4. **Cross-Reference Detection**: Links issues to PRs by checking PR/issue bodies and comments for references
-5. **Display Rendering**: Separates items into sections by state (open/closed for PRs with merged as subset of closed) with colorized output
-6. **Progress Tracking**: Dynamic progress bar that adjusts total count as pagination and additional API calls are discovered
-7. **Error Handling**: Infinite retry with exponential backoff for all API calls, handling rate limits gracefully
+#### Platform Selection
+`main.go` parses flags, sets up `~/.git-feed/.env` and the cache database file, loads environment variables, validates online requirements, then calls `fetchAndDisplayActivity(platform)`.
 
-#### Offline Mode (`--local`)
-1. **Database Loading**: Reads all PRs and issues from `~/.github-feed/github.db` instead of making API calls
-2. **Data Conversion**: Converts database records to PRActivity and IssueActivity structures
-3. **Display Rendering**: Same rendering logic as online mode, showing all cached data
-4. **No API Calls**: Completely offline, no GitHub token required
+#### GitHub Online Mode (Default when `--platform github` and not `--local`)
+1. **Search**: runs several GitHub Search API queries to find PRs and issues the user is involved in.
+2. **Hydrate details**: fetches full PR/issue objects by number (not just search items).
+3. **Review comment collection**: fetches PR review comments for cross-reference detection.
+4. **Caching**: stores PRs, issues, and PR review comments to `~/.git-feed/github.db`.
+5. **Cross-reference nesting**: nests issues under PRs when references are detected in bodies or review comments.
+6. **Rendering**: prints grouped sections (open PRs, closed/merged PRs, open issues, closed issues), optionally with links.
+
+#### GitHub Offline Mode (`--local`)
+1. **Database loading**: reads PRs, issues, and PR review comments from `~/.git-feed/github.db`.
+2. **Filtering**: applies the cutoff time (`--time`) and optional allowed repos.
+3. **Cross-reference nesting**: uses the same cross-reference logic as online mode.
+4. **Rendering**: same output layout as online mode.
+
+#### GitLab Online Mode (Default when `--platform gitlab` and not `--local`)
+GitLab online mode is intentionally bounded: `GITLAB_ALLOWED_REPOS` (or `ALLOWED_REPOS`) must be set.
+
+1. **Project resolution**: resolves each allowed `group[/subgroup]/repo` path to a project ID via the Projects API.
+2. **Per-project scans**: lists merge requests and issues updated after the cutoff using project-scoped list endpoints.
+3. **Label derivation**:
+   - Uses MR/issue author and assignees first.
+   - Uses approval state for "Reviewed" on merge requests.
+   - Uses reviewers list for "Review Requested".
+   - Uses notes (comments) to detect "Commented" and "Mentioned".
+4. **Caching**: stores merge requests, issues, and relevant notes to `~/.git-feed/gitlab.db`.
+5. **Cross-reference nesting**:
+   - Preferred: uses GitLab's "issues closed on merge request" endpoint.
+   - Fallback: parses MR bodies/notes for issue references (same-project refs, qualified refs, and issue URLs).
+6. **Rendering**: same section layout as GitHub mode, using the unified models.
+
+#### GitLab Offline Mode (`--local`)
+1. **Database loading**: reads cached MRs, issues, and notes from `~/.git-feed/gitlab.db`.
+2. **Filtering**: applies cutoff time and allowed projects.
+3. **Cross-reference nesting**: parses MR bodies and cached notes for issue references.
+4. **Rendering**: same output layout.
 
 ### Core Data Structures
 
-**Config**: Global configuration structure (main.go:46-57):
-- Consolidates all application settings (debug mode, local mode, time range, etc.)
-- Shared across the application via global `config` variable
-- Includes client, database, progress, and context references
-- Fields: debugMode, localMode, showLinks, timeRange, username, allowedRepos (map[string]bool), client, db, progress, ctx
+**Config** (`main.go`): runtime configuration and shared references.
+- Controls mode flags (`debugMode`, `localMode`, `showLinks`), platform credentials, allowed repos, and cache handle.
 
-**PRActivity**: Represents a PR with metadata (main.go:22-30):
-- Label: How the user is involved (e.g., "Authored", "Reviewed")
-- Owner/Repo: Repository identification
-- PR: GitHub PullRequest object (pointer to github.PullRequest)
-- UpdatedAt: Last update timestamp (time.Time)
-- HasUpdates: True if API version is newer than cached version
-- Issues: Slice of linked IssueActivity that reference this PR
+**PRActivity** (`main.go`): a unified "merge request" activity record.
+- Used for both GitHub pull requests and GitLab merge requests.
+- Fields: involvement label, owner/repo, `MergeRequestModel`, update time, nested issues.
 
-**IssueActivity**: Represents an issue with similar metadata structure (main.go:32-39):
-- Label: How the user is involved
-- Owner/Repo: Repository identification
-- Issue: GitHub Issue object (pointer to github.Issue)
-- UpdatedAt: Last update timestamp
-- HasUpdates: True if API version is newer than cached version
+**IssueActivity** (`main.go`): a unified issue activity record.
 
-**Progress**: Thread-safe progress tracking with colored bar display (main.go:41-44):
-- Uses `atomic.Int32` for both `current` and `total` fields (no mutexes needed)
-- Dynamically adjusts total as pagination and additional API calls are discovered
-- Updates in real-time across all goroutines
-- Provides visual feedback with color-coded completion status (red <33%, yellow <66%, green >=66%)
-- Supports warning messages during retries via `displayWithWarning()` method (main.go:149-159)
-- Methods: increment(), addToTotal(n int), buildBar(), display(), displayWithWarning(message string)
-
-**Database**: BBolt wrapper providing structured storage (db.go:20-22):
-- PRWithLabel and IssueWithLabel: Wraps items with their activity labels
-- Supports both old format (without labels) and new format (with labels) for backwards compatibility
-
-### Key Functions
-
-**getPRLabelPriority / getIssueLabelPriority**: Label priority functions (main.go:61-87):
-- Define priority ordering for PR labels: Authored(1) > Assigned(2) > Reviewed(3) > Review Requested(4) > Commented(5) > Mentioned(6)
-- Define priority ordering for issue labels: Authored(1) > Assigned(2) > Commented(3) > Mentioned(4)
-- Unknown labels get priority 999 (lowest)
-- Used by `shouldUpdateLabel()` to determine if a label should be replaced
-
-**shouldUpdateLabel**: Determines if a label should be updated (main.go:89-104):
-- Takes current label, new label, and isPR flag
-- Returns true if new label has higher priority (lower number)
-- Empty current labels always get updated
-- Ensures PRs/issues always show their most important involvement type
-- Tested in priority_test.go
-
-**fetchAndDisplayActivity**: Main orchestration function (main.go:603-852):
-- Checks GitHub API rate limits before starting (unless in local mode)
-- Initial progress total: 10 (6 PR queries + 4 issue queries) in online mode, or 10 in offline mode
-- In online mode, does NOT add event polling to progress (events API not used in current code)
-- Launches parallel PR/issue searches with dynamic progress tracking
-- Performs cross-reference detection to link issues with PRs
-- Sorts and displays results by state (open PRs, closed/merged PRs, open issues, closed issues)
-- Uses global `config` for all settings
-- Handles both online (API) and offline (database) modes
-
-**retryWithBackoff**: Wraps API calls with infinite retry logic (main.go:161-247):
-- Exponential backoff starting at 1s, max 30s
-- Special handling for rate limit errors (longer backoff with factor 2.0, max 30s)
-- General errors use shorter backoff (factor 1.5, max 5s)
-- Shows countdown timer in progress bar during waits via `displayWithWarning()`
-- Works seamlessly with both debug and normal modes
-- Uses global `config.ctx` for cancellation support
-- Detects rate limit errors by checking for "rate limit", "API rate limit exceeded", or "403" in error messages
-
-**areCrossReferenced**: Determines if a PR and issue reference each other (main.go:854-923):
-- Checks PR/issue body text for mentions first (fast path)
-- Fetching and checking PR comments for issue references only if body check fails
-- Uses mentionsNumber() to detect patterns like "#123", "fixes #123", or full GitHub URLs
-- Returns early if mention found in bodies to avoid API call
-- Adds API call to progress total dynamically only when needed
-- In local mode, loads comments from database instead of API
-
-**collectSearchResults**: Handles PR search with pagination (main.go:1151-1425):
-- Supports both API mode (GitHub search) and local mode (database)
-- In API mode: Paginates through GitHub search results, dynamically adds pages to progress
-- In local mode: Filters by storedLabel matching the query label, respects timeRange cutoff
-- Uses `sync.Map` for thread-safe deduplication (seenPRs and activitiesMap)
-- Implements label priority system: only updates PR if new label has higher priority
-- In API mode: Does NOT fetch full PR details separately - uses Issue data from search result directly
-- Detects updates by comparing API timestamps with cached versions
-- Caches all data to database with labels for offline mode
-- Filters by allowed repos if configured
-
-**collectIssueSearchResults**: Handles issue search (main.go:1493-1709):
-- Same pattern as PR collection but for issues
-- Filters out items with PullRequestLinks (actual PRs, not issues)
-- Uses `sync.Map` for thread-safe deduplication
-- Implements label priority system for issues
-- Stores issues with their activity labels
-- Detects updates by comparing API timestamps with cached versions
-- In local mode: filters by storedLabel and timeRange
-
-**collectActivityFromEvents**: ~~NOT CURRENTLY CALLED in the codebase~~ ✅ **REMOVED** - Dead code removed (was 186 lines)
-- This function existed but was never invoked by fetchAndDisplayActivity
-- Removed to reduce code complexity and maintainability burden
-
-**displayPR**: Renders a PR with color-coded information (main.go:1241-1267):
-- Formatted date, label, username, repo, and title
-- Update indicator (yellow ● icon) if item has updates since last cache
-- Optional hyperlink with 🔗 icon (when `--links` flag is used)
-- Uses global `config.showLinks` setting
-- Format: `[●] YYYY/MM/DD LABEL USERNAME owner/repo#NUM - title`
-
-**displayIssue**: Renders an issue (main.go:1455-1491):
-- Similar formatting to displayPR with proper indentation for nested issues
-- State indicator (OPEN/CLOSED) when displayed under a PR (indented with "--")
-- Update indicator (yellow ● icon) if item has updates since last cache
-- Optional hyperlink with proper indentation
-- Uses global `config.showLinks` setting
-
-**Color System**: Consistent color coding throughout:
-- `getUserColor()` (main.go:267-287): FNV hash-based consistent colors per username (11 color options from fatih/color)
-- `getLabelColor()` (main.go:249-265): Fixed colors for involvement types (Authored=cyan, Mentioned=yellow, Assigned=magenta, Commented=blue, Reviewed=green, Review Requested=red, Involved=hi-black, Recent Activity=hi-cyan)
-- `getStateColor()` (main.go:289-300): Fixed colors for PR/issue states (open=green, closed=red, merged=magenta)
-
-**Helper Functions**:
-- `loadEnvFile()` (main.go:302-325): Parses `.env` file and loads environment variables, skips comments and empty lines
-- `parseTimeRange()` (main.go:327-357): Converts time range strings (e.g., "1h", "2d") to `time.Duration`
-- `isRepoAllowed()` (main.go:549-555): Checks if a repository is in the allowed repos list
-- `checkRateLimit()` (main.go:557-601): Checks GitHub API rate limits before making requests, warns when running low
-- `mentionsNumber()` (main.go:925-962): Detects if text mentions a specific PR/issue number (supports patterns: #NUM, fixes #NUM, closes #NUM, resolves #NUM, GitHub URLs)
+**MergeRequestModel** / **IssueModel** (`main.go`): simplified, platform-neutral view models.
+- These are the types stored in BBolt for both platforms.
 
 ### Label Priority System
 
-When a PR or issue appears in multiple search results (e.g., you both authored and reviewed a PR), the tool uses a priority system to determine which label to display:
+When the same item matches multiple involvement sources, the display shows the most important label.
 
-**PR Label Priorities** (from highest to lowest):
-1. Authored - You created the PR
-2. Assigned - You're assigned to the PR
-3. Reviewed - You reviewed the PR
-4. Review Requested - Your review was requested
-5. Commented - You commented on the PR
-6. Mentioned - You were mentioned in the PR
+**PR/MR Label Priorities** (highest to lowest):
+1. Authored
+2. Assigned
+3. Reviewed
+4. Review Requested
+5. Commented
+6. Mentioned
 
-**Issue Label Priorities** (from highest to lowest):
-1. Authored - You created the issue
-2. Assigned - You're assigned to the issue
-3. Commented - You commented on the issue
-4. Mentioned - You were mentioned in the issue
+**Issue Label Priorities** (highest to lowest):
+1. Authored
+2. Assigned
+3. Commented
+4. Mentioned
 
-The system ensures that each PR/issue is displayed with its most important involvement type. When processing search results, labels are only updated if the new label has higher priority than the existing one. This prevents less important labels from overwriting more important ones.
+The shared helper `shouldUpdateLabel(current, candidate, isPR)` implements this rule.
 
-### Concurrency Patterns
+### Cross-Reference Detection
 
-The codebase uses `sync.WaitGroup` with goroutines (via `.Go()` method) for parallel API calls:
-- **PR Collection**: 6 parallel search queries (authored, mentioned, assigned, commented, reviewed, review-requested)
-- **Issue Collection**: 4 parallel search queries (authored, mentioned, assigned, commented)
-- **Cross-Reference Detection**: Parallel checking of PR-issue relationships using WaitGroup
+**GitHub** (`platform_github.go`):
+- Only nests issues under PRs within the same repository.
+- Detects references in:
+  - PR body and issue body
+  - PR review comments
+- Supported patterns include:
+  - `#123`
+  - `owner/repo#123`
+  - `https://github.com/owner/repo/issues/123` (and `/pull/`)
 
-All concurrent access to shared data is protected using modern Go patterns:
-- **sync.Map**: `seenPRs`, `seenIssues`, `activitiesMap`, and `issueActivitiesMap` use `sync.Map` for lock-free concurrent access
-- **atomic operations**: `Progress` struct uses `atomic.Int32` for `current` and `total` fields (no mutexes needed)
-- **Conversion to slices**: After all goroutines complete, `sync.Map` data is converted to regular slices for sorting/display
-
-Progress tracking is thread-safe and updated after each API call across all goroutines. The progress bar dynamically adjusts its total as new work is discovered during execution.
-
-### Time Filtering
-
-Controlled by `--time` flag (default: `1m`):
-- Shows both open and closed items updated in the specified time period
-- Default: Items updated in last month (`1m` = 30 days)
-- Supports flexible time ranges:
-  - `h` = hours (e.g., `3h` = 3 hours)
-  - `d` = days (e.g., `2d` = 2 days)
-  - `w` = weeks (e.g., `3w` = 3 weeks)
-  - `m` = months (e.g., `6m` = 6 months, approximated as 30 days each)
-  - `y` = years (e.g., `1y` = 1 year, approximated as 365 days)
-- No separate state filtering - shows all states (open/merged/closed) from the time period
-- Parsing happens in main() via parseTimeRange() function
+**GitLab** (`platform_gitlab.go`):
+- Preferred nesting via API endpoint: issues closed on merge request.
+- Fallback parsing from MR bodies and notes:
+  - same-project `#123`
+  - qualified `group/subgroup/repo#123`
+  - issue URLs (including relative `/-/issues/123`)
 
 ## GitHub API Integration
 
-Uses `google/go-github/v57` library. Key API patterns:
-- **Search API** for bulk queries: `client.Search.Issues()` - used for both PRs and issues (PRs are identified by PullRequestLinks field)
-- **PullRequests API**: NOT used for individual PR fetching - PR data comes directly from search results
-- **Comments API** for cross-references: `client.PullRequests.ListComments()` - PR comment bodies (only when checking cross-references)
-- **Rate limit checking**: `client.RateLimit.Get()` monitors both core (5000/hr) and search (30/min) limits
+Uses `google/go-github/v57`.
 
-**Error Handling**: All API calls wrapped with `retryWithBackoff()`:
-- Infinite retries with exponential backoff
-- Rate limit detection via error message inspection
-- Countdown timer displayed during backoff periods
-- Context-aware cancellation support
+Key API patterns in `platform_github.go`:
+- Search: `client.Search.Issues()` to discover candidate items.
+- Details: `client.PullRequests.Get()` and `client.Issues.Get()` to fetch canonical fields.
+- Comments: `client.PullRequests.ListComments()` for review comment bodies (used for cross-reference detection).
 
-**Progress Bar Accuracy**: The progress bar accurately tracks all API calls:
-- Initial total: 10 (6 PR searches + 4 issue searches) in online mode
-- Dynamically adds pagination when discovered on first page of results (lastPage - 1 additional pages)
-- Dynamically adds comment fetches during cross-reference checks (only when body mentions not found)
-- Each API call increments counter immediately after completion
-- Does NOT track individual PR detail fetches (as they don't happen)
+## GitLab API Integration
+
+Uses `gitlab.com/gitlab-org/api/client-go`.
+
+Base URL handling:
+- `GITLAB_HOST` or `GITLAB_BASE_URL` is normalized to include `/api/v4` (and supports path prefixes).
+
+Retry strategy:
+- GitLab requests are wrapped via `retryWithBackoff()` for 429 rate limits and transient 5xx errors.
+- For 429 responses the code respects `Retry-After` when present, otherwise uses `Ratelimit-Reset` when available.
 
 ## Database Module (db.go)
 
-**Database** structure wraps BBolt operations with three buckets:
-- `pull_requests`: Stores PRs with key format `owner/repo#number`
-- `issues`: Stores issues with same key format
-- `comments`: Stores PR/issue comments with key format `owner/repo#number/type/commentID`
+The cache uses BBolt and stores platform data as JSON.
 
-**Data Format Evolution**:
-- Old format: Direct JSON serialization of `github.PullRequest` / `github.Issue`
-- New format: Wrapped in `PRWithLabel` / `IssueWithLabel` to store activity labels
-- All read functions support both formats for backwards compatibility
+Buckets:
+- GitLab: `gitlab_merge_requests`, `gitlab_issues`, `gitlab_notes`
+- GitHub: `pull_requests`, `issues`, `comments`
 
-**Key Database Functions**:
+Key formats:
+- GitLab MR key: `path_with_namespace#!IID`
+- GitLab issue key: `path_with_namespace##IID`
+- GitLab note key: `path|itemType|iid|noteID`
+- GitHub item key: `owner/repo#number`
+- GitHub PR review comment key: `owner/repo#number/pr_review_comment/commentID`
 
-**Saving Data** (with labels, new format):
-- `SavePullRequestWithLabel(owner, repo, pr, label, debugMode)` (db.go:90-120): Wraps PR in PRWithLabel, marshals to JSON, stores in pull_requests bucket
-- `SaveIssueWithLabel(owner, repo, issue, label, debugMode)` (db.go:215-245): Same pattern for issues with IssueWithLabel
-- `SavePRComment(owner, repo, prNumber, comment, debugMode)` (db.go:322-347): Stores PR review comments with key format `owner/repo#NUM/pr_review_comment/commentID`
-
-**Saving Data** (legacy, without labels):
-- `SavePullRequest(owner, repo, pr, debugMode)` (db.go:63-88): Legacy format, still supported
-- `SaveIssue(owner, repo, issue, debugMode)` (db.go:188-213): Legacy format
-- `SaveComment(owner, repo, itemNumber, comment, commentType)` (db.go:308-320): Generic comment storage
-
-**Reading Data**:
-- `GetPullRequest(owner, repo, number)` (db.go:122-146): Returns PR, attempts new format first, falls back to old format
-- `GetPullRequestWithLabel(owner, repo, number)` (db.go:148-181): Returns PR and label, handles both formats
-- `GetIssue(owner, repo, number)` (db.go:247-271): Returns issue, handles both formats
-- `GetIssueWithLabel(owner, repo, number)` (db.go:273-306): Returns issue and label
-- `GetPRComments(owner, repo, prNumber)` (db.go:573-595): Returns all PR comments using cursor-based prefix search
-- `GetComment(owner, repo, itemNumber, commentType, commentID)` (db.go:349-366): Returns single comment
-
-**Bulk Reading**:
-- `GetAllPullRequests(debugMode)` (db.go:378-418): Returns map[string]*github.PullRequest, handles both formats
-- `GetAllPullRequestsWithLabels(debugMode)` (db.go:420-465): Returns PRs and labels separately, used for offline mode
-- `GetAllIssues(debugMode)` (db.go:467-507): Returns map[string]*github.Issue
-- `GetAllIssuesWithLabels(debugMode)` (db.go:509-554): Returns issues and labels separately
-- `GetAllComments()` (db.go:556-571): Returns all comment bodies as strings
-
-**Utility**:
-- `Stats()` (db.go:368-376): Returns counts of PRs, issues, and comments in database
-- `Close()` (db.go:54-56): Closes BBolt database connection
-- `OpenDatabase(path)` (db.go:24-52): Opens/creates database, creates buckets, sets permissions to 0666
+Data formats:
+- GitHub and GitLab store their simplified models (`MergeRequestModel`, `IssueModel`) wrapped with a `Label` field.
+- GitHub readers keep backwards compatibility by falling back to unmarshaling legacy (unwrapped) records.
 
 ## Command-Line Flags
 
-Flags are parsed manually in main() (main.go:359-410):
-- `--time RANGE`: Show items from last time range (default: `1m`)
-  - Examples: `1h` (hour), `2d` (days), `3w` (weeks), `4m` (months), `1y` (year)
-- `--debug`: Show detailed API logging instead of progress bar
-- `--local`: Use local database instead of GitHub API (offline mode, no token required)
-- `--links`: Show hyperlinks (🔗) underneath each PR/issue
-- `--ll`: Shortcut for `--local --links` (offline mode with links) - IMPORTANT: This flag is NOT implemented in the code
-- `--clean`: Delete and recreate the database cache (useful for starting fresh)
-- `--allowed-repos REPOS`: Filter to specific repositories (comma-separated: `owner/repo1,owner/repo2`)
+Flags are parsed with the standard library `flag` package (`main.go`).
 
-**NOTE**: The `--ll` flag is documented in README but NOT implemented in the command-line parsing logic. Only `--local` and `--links` work as separate flags.
+- `--platform github|gitlab` (default: `github`)
+- `--time RANGE` (default: `1m`; supports `h`, `d`, `w`, `m`, `y`)
+- `--debug` (verbose logging)
+- `--local` (offline mode from cache)
+- `--links` (print item URLs under each entry)
+- `--ll` (shortcut for `--local --links`)
+- `--clean` (delete and recreate the selected platform DB)
+- `--allowed-repos` (comma-separated)
+  - GitHub: `owner/repo`
+  - GitLab: `group[/subgroup]/repo`
+
+Allowed repo resolution order:
+1. `--allowed-repos`
+2. `GITHUB_ALLOWED_REPOS` or `GITLAB_ALLOWED_REPOS` (depending on `--platform`)
+3. `ALLOWED_REPOS` (legacy fallback)
 
 ## Testing Considerations
 
 When modifying this codebase:
-- **Mode Testing**: Test with both `--debug` and default modes (progress bar vs. detailed logs)
-- **Offline Mode**: Test `--local` mode to ensure database reads work correctly
-- **Link Display**: Test `--links` flag to verify URLs are displayed correctly with proper indentation
-- **Concurrency Safety**: Verify atomic operations and `sync.Map` usage on any new shared data structures
-- **Label Priority**: Test label updates to ensure priority system works correctly (see priority_test.go)
-- **Cross-Reference Patterns**: Test with various mention patterns: `#123`, `fixes #123`, `closes #123`, GitHub URLs
-- **Rate Limits**: Consider GitHub API rate limits when adding new API calls (5000/hr core, 30/min search)
-- **Progress Tracking**: When adding new API calls, ensure progress bar is updated:
-  - Add to total before making the call: `config.progress.addToTotal(1)`
-  - Increment after call completes: `config.progress.increment()`
-  - Display after each update: `config.progress.display()` (unless debug mode)
-- **Error Handling**: Wrap all API calls with `retryWithBackoff()` for resilience
-- **Database Errors**: Currently some database write errors are silently ignored with `_` - consider adding error logging
-- **First Run**: Verify `~/.github-feed/` directory is created on first run with proper permissions (0755 for dir, 0600 for .env, 0666 for db)
-- **Backwards Compatibility**: When changing database format, ensure old format can still be read
-- **Global Config**: Use global `config` variable instead of passing parameters individually
+- Validate both platforms (`--platform github` and `--platform gitlab`).
+- Validate both modes (`--local` vs online).
+- If touching GitLab behavior, ensure rate limit/backoff behavior still passes the table-driven tests.
+- If changing reference parsing, add tests for both GitHub and GitLab patterns.
+- Cache schema changes should preserve offline compatibility.
 
 ## Testing
 
-The project includes unit tests for critical functionality:
+Run the full test suite:
 
-**priority_test.go**: Tests for label priority system
-- `TestPRLabelPriority`: Validates PR label priority ordering (6 labels + unknown)
-- `TestIssueLabelPriority`: Validates issue label priority ordering (4 labels + unknown)
-- `TestShouldUpdateLabel_PR`: Tests PR label update logic with 7 test cases covering priority combinations
-- `TestShouldUpdateLabel_Issue`: Tests issue label update logic with 7 test cases
-
-Run tests with:
 ```bash
-go test -v
-go test -v -run TestPRLabelPriority  # Run specific test
+go test ./... -count=1
 ```
+
+Notable tests (in `priority_test.go`):
+- label priority and `shouldUpdateLabel()` behavior
+- GitLab base URL normalization (`normalizeGitLabBaseURL`)
+- retry/backoff behavior for GitLab rate limits and transient errors (`retryWithBackoff`)
+- database round-trip and offline parity for GitLab cache
+- end-to-end `go run . --platform gitlab --debug` against a mock GitLab server
 
 ## Known Issues & Discrepancies
 
-1. ~~**`--ll` flag**: Documented in README but NOT implemented in code~~ ✅ **FIXED** - Flag now properly implemented (lines 395-397)
-2. ~~**collectActivityFromEvents**: Function exists but is never called~~ ✅ **FIXED** - Dead code removed (186 lines)
-3. **Initial progress total**: README mentions "7 PR queries" but actual code uses 6 PR queries
-4. **PR detail fetching**: Code no longer fetches individual PR details via PullRequests.Get() - uses search result data directly
-5. ~~**Database write errors**: Some database Save operations ignore errors~~ ✅ **FIXED** - Error logging added with atomic counter and summary warnings
+These are documentation/behavior mismatches worth keeping in mind while working on the repo:
+
+1. GitLab username env vars: `GITLAB_USERNAME` / `GITLAB_USER` appear in the usage text and `.env` template, but the current implementation resolves the current user via API and does not read those variables.
+2. Progress bar wiring: a `Progress` type exists and is used for retry countdown messaging when set, but `config.progress` is not initialized in the main execution path (so progress rendering is effectively disabled).
 
 ## Refactoring Opportunities
 
-Based on code analysis, potential improvements include:
-1. ✅ **COMPLETED: Atomic Operations** - Progress now uses `atomic.Int32` instead of mutexes
-2. ✅ **COMPLETED: sync.Map** - All shared maps now use `sync.Map` for lock-free concurrency
-3. ✅ **COMPLETED: Progress Bar Logic** - `buildBar()` method extracts progress bar building logic (main.go:114-136)
-4. **Implement `--ll` flag**: Add parsing for combined `--local --links` shortcut
-5. **Remove collectActivityFromEvents**: Delete unused code or re-integrate if needed
-6. **Error Handling**: Add logging for ignored database write errors
-7. **Code Reuse**: Extract common patterns between collectSearchResults and collectIssueSearchResults (both follow same structure)
-8. **Display Logic**: Unify displayPR and displayIssue with generic display function
-9. **Database Operations**: Extract common patterns in GetAll* functions (all do similar iteration and format handling)
-10. **Channels**: Consider replacing WaitGroups with result channels for cleaner coordination
+Potential improvements that would reduce complexity or improve UX (not required for normal changes):
+- Parallelize GitHub query passes and/or per-project GitLab scanning while keeping API usage bounded.
+- Wire up `Progress` in non-debug mode (or remove it if not desired).
+- Consolidate shared display and nesting logic further, while keeping platform-specific API details isolated.
 
 ## File Structure
 
 ```
-github-feed/
-├── main.go                      # Main application (1710 lines)
-├── db.go                        # Database operations (596 lines)
-├── priority_test.go             # Unit tests (106 lines)
-├── go.mod                       # Go module definition
-├── go.sum                       # Go module checksums
-├── README.md                    # User documentation
-├── CLAUDE.md                    # This file (AI assistant instructions)
-├── .goreleaser.yml              # GoReleaser configuration for builds
-├── .gitignore                   # Git ignore patterns
+git-feed/
+├── main.go                      # CLI entrypoint, config, shared models, output rendering
+├── platform_github.go           # GitHub API fetch + caching + nesting
+├── platform_gitlab.go           # GitLab API fetch + caching + nesting + retry
+├── db.go                        # BBolt schema and persistence helpers
+├── priority_test.go             # Unit/integration tests
+├── go.mod                       # Module: github.com/zveinn/git-feed
+├── go.sum
+├── README.md
+├── CLAUDE.md
+├── .goreleaser.yml
 └── .github/
     └── workflows/
-        └── release.yml          # GitHub Actions workflow for releases
+        └── release.yml
 
-~/.github-feed/                  # Config directory (auto-created)
- ├── .env                        # Configuration file with credentials
- └── github.db                   # BBolt database for caching
+~/.git-feed/                     # Config directory (auto-created)
+ ├── .env                        # Shared configuration file
+ ├── github.db                   # GitHub cache DB (created after running with --platform github)
+ └── gitlab.db                   # GitLab cache DB (created after running with --platform gitlab)
+```
+
+## Testing
+
+```bash
+go test ./... -count=1
 ```

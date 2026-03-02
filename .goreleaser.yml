@@ -1,13 +1,15 @@
 version: 2
 
+project_name: git-feed
+
 before:
   hooks:
     # You may remove this if you don't use go modules.
     - go mod tidy
 
 builds:
-  - id: github-feed
-    binary: github-feed
+  - id: git-feed
+    binary: git-feed
     env:
       - CGO_ENABLED=0
     goos:
@@ -63,7 +65,7 @@ changelog:
 release:
   github:
     owner: zveinn
-    name: github-feed
+    name: git-feed
   draft: false
   prerelease: auto
   mode: replace
@@ -74,28 +76,28 @@ release:
     ### macOS
     ```bash
     # Intel Mac
-    tar -xzf github-feed_{{.Version}}_Darwin_x86_64.tar.gz
-    chmod +x github-feed
-    sudo mv github-feed /usr/local/bin/
+    tar -xzf git-feed_{{.Version}}_Darwin_x86_64.tar.gz
+    chmod +x git-feed
+    sudo mv git-feed /usr/local/bin/
 
     # Apple Silicon Mac
-    tar -xzf github-feed_{{.Version}}_Darwin_arm64.tar.gz
-    chmod +x github-feed
-    sudo mv github-feed /usr/local/bin/
+    tar -xzf git-feed_{{.Version}}_Darwin_arm64.tar.gz
+    chmod +x git-feed
+    sudo mv git-feed /usr/local/bin/
     ```
 
     ### Linux
     ```bash
     # x86_64
-    tar -xzf github-feed_{{.Version}}_Linux_x86_64.tar.gz
-    chmod +x github-feed
-    sudo mv github-feed /usr/local/bin/
+    tar -xzf git-feed_{{.Version}}_Linux_x86_64.tar.gz
+    chmod +x git-feed
+    sudo mv git-feed /usr/local/bin/
 
     # ARM64
-    tar -xzf github-feed_{{.Version}}_Linux_arm64.tar.gz
-    chmod +x github-feed
-    sudo mv github-feed /usr/local/bin/
+    tar -xzf git-feed_{{.Version}}_Linux_arm64.tar.gz
+    chmod +x git-feed
+    sudo mv git-feed /usr/local/bin/
     ```
 
     ### Windows
-    Download the appropriate `.zip` file, extract it, and add the `github-feed.exe` to your PATH.
+    Download the appropriate `.zip` file, extract it, and add the `git-feed.exe` to your PATH.
