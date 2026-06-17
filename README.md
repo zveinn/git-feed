@@ -211,7 +211,8 @@ github-feed --local --time 2w --debug --links --allowed-repos="miniohq/ec,tunnel
 3. **Cross-Reference Detection** - Automatically finds connections between PRs and issues by:
    - Checking PR body and comments for issue references (`#123`, `fixes #123`, full URLs)
    - Checking issue body and comments for PR references
-   - Displaying linked issues directly under their related PRs
+   - Displaying linked issues nested under their related PRs
+   - Every issue you're involved in (authored, assigned, commented, or mentioned) always appears in the OPEN/CLOSED ISSUES sections too — even when it's also nested under a PR
 
 4. **Smart Filtering**:
    - Shows both open and closed items from the specified time period
