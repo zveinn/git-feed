@@ -767,8 +767,6 @@ func fetchAndDisplayActivity() {
 		fmt.Println("Checking cross-references between PRs and issues...")
 	}
 
-	linkedIssues := make(map[string]bool)
-
 	// Channel-based approach to avoid race conditions
 	type crossRefResult struct {
 		prIndex   int
@@ -786,7 +784,6 @@ func fetchAndDisplayActivity() {
 		for result := range resultsChan {
 			// Safe to modify since only this goroutine accesses these
 			activities[result.prIndex].Issues = append(activities[result.prIndex].Issues, result.issue)
-			linkedIssues[result.issueKey] = true
 			if config.debugMode {
 				fmt.Println(result.debugInfo)
 			}
@@ -830,13 +827,13 @@ func fetchAndDisplayActivity() {
 	close(resultsChan)
 	<-collectorDone
 
-	standaloneIssues := []IssueActivity{}
-	for _, issue := range issueActivities {
-		issueKey := buildItemKey(issue.Owner, issue.Repo, issue.Issue.GetNumber())
-		if !linkedIssues[issueKey] {
-			standaloneIssues = append(standaloneIssues, issue)
-		}
-	}
+	// Every issue we found was discovered via an involvement search query
+	// (authored, assigned, commented, or mentioned), so it is linked to the
+	// user in some way and always belongs in the OPEN/CLOSED ISSUES sections.
+	// Issues that also cross-reference a PR are *additionally* shown nested
+	// under that PR above; they are no longer removed from this list.
+	standaloneIssues := make([]IssueActivity, len(issueActivities))
+	copy(standaloneIssues, issueActivities)
 
 	duration := time.Since(startTime)
 	if config.debugMode {
