@@ -1,5 +1,9 @@
 version: 2
 
+# Keep artifact/archive names as "github-feed" (the binary name) even though
+# the GitHub repository was renamed to "git-feed".
+project_name: github-feed
+
 before:
   hooks:
     # You may remove this if you don't use go modules.
@@ -63,7 +67,7 @@ changelog:
 release:
   github:
     owner: zveinn
-    name: github-feed
+    name: git-feed
   draft: false
   prerelease: auto
   mode: replace

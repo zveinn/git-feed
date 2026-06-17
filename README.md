@@ -16,17 +16,17 @@ A fast, colorful CLI tool for monitoring GitHub pull requests and issues across 
 
 ### Pre-built Binaries (Recommended)
 
-Download the latest release for your platform from the [releases page](https://github.com/zveinn/github-feed/releases):
+Download the latest release for your platform from the [releases page](https://github.com/zveinn/git-feed/releases):
 
 **macOS**
 ```bash
 # Intel Mac
-curl -L https://github.com/zveinn/github-feed/releases/latest/download/github-feed_<VERSION>_Darwin_x86_64.tar.gz | tar xz
+curl -L https://github.com/zveinn/git-feed/releases/latest/download/github-feed_<VERSION>_Darwin_x86_64.tar.gz | tar xz
 chmod +x github-feed
 sudo mv github-feed /usr/local/bin/
 
 # Apple Silicon Mac
-curl -L https://github.com/zveinn/github-feed/releases/latest/download/github-feed_<VERSION>_Darwin_arm64.tar.gz | tar xz
+curl -L https://github.com/zveinn/git-feed/releases/latest/download/github-feed_<VERSION>_Darwin_arm64.tar.gz | tar xz
 chmod +x github-feed
 sudo mv github-feed /usr/local/bin/
 ```
@@ -34,12 +34,12 @@ sudo mv github-feed /usr/local/bin/
 **Linux**
 ```bash
 # x86_64
-curl -L https://github.com/zveinn/github-feed/releases/latest/download/github-feed_<VERSION>_Linux_x86_64.tar.gz | tar xz
+curl -L https://github.com/zveinn/git-feed/releases/latest/download/github-feed_<VERSION>_Linux_x86_64.tar.gz | tar xz
 chmod +x github-feed
 sudo mv github-feed /usr/local/bin/
 
 # ARM64
-curl -L https://github.com/zveinn/github-feed/releases/latest/download/github-feed_<VERSION>_Linux_arm64.tar.gz | tar xz
+curl -L https://github.com/zveinn/git-feed/releases/latest/download/github-feed_<VERSION>_Linux_arm64.tar.gz | tar xz
 chmod +x github-feed
 sudo mv github-feed /usr/local/bin/
 ```
