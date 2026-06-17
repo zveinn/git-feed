@@ -1,4 +1,4 @@
-# GitAI - GitHub Activity Monitor
+# GitHub Activity Monitor
 
 A fast, colorful CLI tool for monitoring GitHub pull requests and issues across repositories. Track your contributions, reviews, and assignments with real-time progress visualization.
 
