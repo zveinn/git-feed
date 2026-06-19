@@ -69,6 +69,7 @@ func getPRLabelPriority(label string) int {
 		"Review Requested": 4,
 		"Commented":        5,
 		"Mentioned":        6,
+		"Involved":         7,
 	}
 	if priority, ok := priorities[label]; ok {
 		return priority
@@ -82,6 +83,7 @@ func getIssueLabelPriority(label string) int {
 		"Assigned":  2,
 		"Commented": 3,
 		"Mentioned": 4,
+		"Involved":  5,
 	}
 	if priority, ok := priorities[label]; ok {
 		return priority
@@ -310,7 +312,6 @@ func getLabelColor(label string) *color.Color {
 		"Reviewed":         color.New(color.FgGreen),
 		"Review Requested": color.New(color.FgRed),
 		"Involved":         color.New(color.FgHiBlack),
-		"Recent Activity":  color.New(color.FgHiCyan),
 	}
 
 	if c, ok := labelColors[label]; ok {
@@ -666,84 +667,127 @@ func fetchAndDisplayActivity() {
 		}
 	}
 
-	var seenPRs sync.Map        // Maps prKey -> label
+	var seenPRs sync.Map        // Maps prKey -> label (used only in online path)
 	activitiesMap := sync.Map{} // Maps prKey -> *PRActivity
 
-	// 6 PR queries + 4 issue queries = 10 total
-	initialTotal := 10
-	if !config.localMode {
-		initialTotal += 3 // Add 3 for event pages
-	}
+	var seenIssues sync.Map          // Maps issueKey -> label (used only in online path)
+	issueActivitiesMap := sync.Map{} // Maps issueKey -> *IssueActivity
+
+	// Base query count is 8 (5 PR + 3 Issue).
+	// In online mode we preload the --time window from the local DB first.
+	// We then compute a (usually much smaller) search window using the newest
+	// updated time we already have + a safety buffer.
+	// This turns most runs into cheap "delta" fetches instead of re-downloading
+	// the entire --time range every time.
+	//
+	// The 8 queries still use the same role labels + involves strategy.
+	initialTotal := 8
 	config.progress = &Progress{}
 	config.progress.current.Store(0)
 	config.progress.total.Store(int32(initialTotal))
 
-	if config.debugMode {
+	// Always preload data from the database for the requested --time window.
+	// This gives us:
+	// - All historical items for display (in both modes)
+	// - The ability to compute a tight "search since" date for online mode
+	//   so we only ask GitHub for recent changes instead of re-fetching the
+	//   entire --time window every run.
+	if config.db != nil {
+		loadAllFromDB(&activitiesMap, &issueActivitiesMap)
+	}
+
+	if config.localMode {
+		if config.debugMode {
+			fmt.Println("Loading from local database (offline mode)...")
+		} else {
+			fmt.Println("Loading from local database...")
+		}
+	} else if config.debugMode {
 		fmt.Println("Running optimized search queries...")
 	} else {
 		fmt.Print("Fetching data from GitHub... ")
 		config.progress.display()
 	}
 
-	dateAgo := time.Now().Add(-config.timeRange).Format("2006-01-02")
-	dateFilter := fmt.Sprintf("updated:>=%s", dateAgo)
+	// Full window requested by the user (used for final filtering / preload)
+	fullDateAgo := time.Now().Add(-config.timeRange).Format("2006-01-02")
+
+	// For searches (online mode only), we try to use a much smaller window
+	// based on the newest thing we already have in the DB. This dramatically
+	// reduces the number of Search API calls when the user has a long --time
+	// (e.g. 3m) but runs the tool frequently.
+	searchDateAgo := fullDateAgo
+	if !config.localMode {
+		if maxT := findMaxUpdated(&activitiesMap, &issueActivitiesMap); !maxT.IsZero() {
+			safetyBuffer := 2 * time.Hour
+			candidate := maxT.Add(-safetyBuffer)
+			userWindowStart := time.Now().Add(-config.timeRange)
+			if candidate.After(userWindowStart) {
+				searchDateAgo = candidate.Format("2006-01-02")
+			}
+		}
+	}
+
+	dateFilter := fmt.Sprintf("updated:>=%s", searchDateAgo)
 
 	buildQuery := func(base string) string {
 		return fmt.Sprintf("%s %s", base, dateFilter)
 	}
 
-	var prWg sync.WaitGroup
+	if !config.localMode {
+		if config.debugMode && searchDateAgo != fullDateAgo {
+			fmt.Printf("  [DB] Using incremental search since %s (full window: %s)\n", searchDateAgo, fullDateAgo)
+		}
 
-	prQueries := []struct {
-		query string
-		label string
-	}{
-		{buildQuery(fmt.Sprintf("is:pr reviewed-by:%s", config.username)), "Reviewed"},
-		{buildQuery(fmt.Sprintf("is:pr review-requested:%s", config.username)), "Review Requested"},
-		{buildQuery(fmt.Sprintf("is:pr author:%s", config.username)), "Authored"},
-		{buildQuery(fmt.Sprintf("is:pr assignee:%s", config.username)), "Assigned"},
-		{buildQuery(fmt.Sprintf("is:pr commenter:%s", config.username)), "Commented"},
-		{buildQuery(fmt.Sprintf("is:pr mentions:%s", config.username)), "Mentioned"},
+		var prWg sync.WaitGroup
+
+		prQueries := []struct {
+			query string
+			label string
+		}{
+			{buildQuery(fmt.Sprintf("is:pr reviewed-by:%s", config.username)), "Reviewed"},
+			{buildQuery(fmt.Sprintf("is:pr review-requested:%s", config.username)), "Review Requested"},
+			{buildQuery(fmt.Sprintf("is:pr author:%s", config.username)), "Authored"},
+			{buildQuery(fmt.Sprintf("is:pr assignee:%s", config.username)), "Assigned"},
+			{buildQuery(fmt.Sprintf("is:pr involves:%s", config.username)), "Involved"},
+		}
+
+		for _, pq := range prQueries {
+			query := pq.query
+			label := pq.label
+			prWg.Go(func() {
+				collectSearchResults(query, label, &seenPRs, &activitiesMap)
+			})
+		}
+
+		prWg.Wait()
+
+		if config.debugMode {
+			fmt.Println()
+			fmt.Println("Running issue search queries...")
+		}
+
+		var issueWg sync.WaitGroup
+
+		issueQueries := []struct {
+			query string
+			label string
+		}{
+			{buildQuery(fmt.Sprintf("is:issue author:%s", config.username)), "Authored"},
+			{buildQuery(fmt.Sprintf("is:issue assignee:%s", config.username)), "Assigned"},
+			{buildQuery(fmt.Sprintf("is:issue involves:%s", config.username)), "Involved"},
+		}
+
+		for _, iq := range issueQueries {
+			query := iq.query
+			label := iq.label
+			issueWg.Go(func() {
+				collectIssueSearchResults(query, label, &seenIssues, &issueActivitiesMap)
+			})
+		}
+
+		issueWg.Wait()
 	}
-
-	for _, pq := range prQueries {
-		query := pq.query
-		label := pq.label
-		prWg.Go(func() {
-			collectSearchResults(query, label, &seenPRs, &activitiesMap)
-		})
-	}
-
-	prWg.Wait()
-
-	if config.debugMode {
-		fmt.Println()
-		fmt.Println("Running issue search queries...")
-	}
-	var seenIssues sync.Map          // Maps issueKey -> label
-	issueActivitiesMap := sync.Map{} // Maps issueKey -> *IssueActivity
-
-	var issueWg sync.WaitGroup
-
-	issueQueries := []struct {
-		query string
-		label string
-	}{
-		{buildQuery(fmt.Sprintf("is:issue author:%s", config.username)), "Authored"},
-		{buildQuery(fmt.Sprintf("is:issue mentions:%s", config.username)), "Mentioned"},
-		{buildQuery(fmt.Sprintf("is:issue assignee:%s", config.username)), "Assigned"},
-		{buildQuery(fmt.Sprintf("is:issue commenter:%s", config.username)), "Commented"},
-	}
-
-	for _, iq := range issueQueries {
-		query := iq.query
-		label := iq.label
-		issueWg.Go(func() {
-			collectIssueSearchResults(query, label, &seenIssues, &issueActivitiesMap)
-		})
-	}
-
-	issueWg.Wait()
 
 	// Convert activitiesMap to slice
 	activities := []PRActivity{}
@@ -975,26 +1019,51 @@ func areCrossReferenced(pr *PRActivity, issue *IssueActivity) bool {
 			}
 		}
 	} else {
-		config.progress.addToTotal(1)
-		if !config.debugMode {
-			config.progress.display()
-		}
+		// Paginate to get all review comments (previously only first 100).
+		// Each page counts as progress work.
+		var allComments []*github.PullRequestComment
+		page := 1
+		for {
+			if page > 1 {
+				config.progress.addToTotal(1)
+				if !config.debugMode {
+					config.progress.display()
+				}
+			} else {
+				config.progress.addToTotal(1)
+				if !config.debugMode {
+					config.progress.display()
+				}
+			}
 
-		retryErr := retryWithBackoff(func() error {
-			prComments, _, err = config.client.PullRequests.ListComments(config.ctx, pr.Owner, pr.Repo, prNumber, &github.PullRequestListCommentsOptions{
-				ListOptions: github.ListOptions{PerPage: 100},
-			})
-			return err
-		}, fmt.Sprintf("Comments-PR#%d", prNumber))
+			var resp *github.Response
+			var pageComments []*github.PullRequestComment
+			retryErr := retryWithBackoff(func() error {
+				var e error
+				pageComments, resp, e = config.client.PullRequests.ListComments(config.ctx, pr.Owner, pr.Repo, prNumber, &github.PullRequestListCommentsOptions{
+					ListOptions: github.ListOptions{PerPage: 100, Page: page},
+				})
+				return e
+			}, fmt.Sprintf("Comments-PR#%d-p%d", prNumber, page))
 
-		config.progress.increment()
-		if !config.debugMode {
-			config.progress.display()
-		}
+			config.progress.increment()
+			if !config.debugMode {
+				config.progress.display()
+			}
 
-		if retryErr != nil {
-			err = retryErr
+			if retryErr != nil {
+				err = retryErr
+				break
+			}
+
+			allComments = append(allComments, pageComments...)
+
+			if resp == nil || resp.NextPage == 0 {
+				break
+			}
+			page = resp.NextPage
 		}
+		prComments = allComments
 
 		if err == nil && config.db != nil {
 			for _, comment := range prComments {
@@ -1058,33 +1127,31 @@ func mentionsNumber(text string, number int, owner string, repo string) bool {
 	return false
 }
 
-func collectSearchResults(query, label string, seenPRs *sync.Map, activitiesMap *sync.Map) {
-	if config.localMode {
-		if config.db == nil {
-			return
-		}
+// loadAllFromDB populates the activity maps from the database using stored labels.
+// Loads every cached item within the --time window (respecting allowed repos).
+// Used for:
+// - Pure --local mode (offline view using stored labels)
+// - Online mode: preload the window from DB as base data, then run (possibly delta)
+//   searches so that only recent changes are fetched from GitHub. This avoids
+//   repeatedly hitting the Search API with full --time windows.
+func loadAllFromDB(activitiesMap *sync.Map, issueActivitiesMap *sync.Map) {
+	if config.db == nil {
+		return
+	}
 
-		allPRs, prLabels, err := config.db.GetAllPullRequestsWithLabels(config.debugMode)
-		if err != nil {
-			if config.debugMode {
-				fmt.Printf("  [%s] Error loading from database: %v\n", label, err)
-			}
-			return
-		}
+	cutoffTime := time.Now().Add(-config.timeRange)
 
+	// Load PRs
+	allPRs, prLabels, err := config.db.GetAllPullRequestsWithLabels(config.debugMode)
+	if err != nil {
 		if config.debugMode {
-			fmt.Printf("  [%s] Loading from database...\n", label)
+			fmt.Printf("  [DB] Error loading PRs from database: %v\n", err)
 		}
-
-		totalFound := 0
-		cutoffTime := time.Now().Add(-config.timeRange)
+	} else {
+		if config.debugMode {
+			fmt.Println("  [DB] Loading PRs from database...")
+		}
 		for key, pr := range allPRs {
-			storedLabel := prLabels[key]
-
-			if storedLabel != label {
-				continue
-			}
-
 			if pr.GetUpdatedAt().Time.Before(cutoffTime) {
 				continue
 			}
@@ -1105,44 +1172,105 @@ func collectSearchResults(query, label string, seenPRs *sync.Map, activitiesMap 
 				continue
 			}
 
-			prKey := key
-
-			// Check if we've already processed this PR in activitiesMap
-			existingActivity, alreadyProcessed := activitiesMap.Load(prKey)
-			shouldProcess := true
-
-			if alreadyProcessed {
-				existingPR := existingActivity.(*PRActivity)
-				if shouldUpdateLabel(existingPR.Label, label, true) {
-					// New label has higher priority, we'll update it
-					if config.debugMode {
-						fmt.Printf("  [%s] Updating label for %s from %s to %s (higher priority)\n", label, prKey, existingPR.Label, label)
-					}
-				} else {
-					// Existing label has higher or equal priority, skip
-					shouldProcess = false
-				}
+			storedLabel := prLabels[key]
+			if storedLabel == "" {
+				storedLabel = "Involved"
 			}
 
-			if shouldProcess {
-				activity := PRActivity{
-					Label:     label,
-					Owner:     owner,
-					Repo:      repo,
-					PR:        pr,
-					UpdatedAt: pr.GetUpdatedAt().Time,
-				}
-				activitiesMap.Store(prKey, &activity)
-				totalFound++
+			activity := PRActivity{
+				Label:     storedLabel,
+				Owner:     owner,
+				Repo:      repo,
+				PR:        pr,
+				UpdatedAt: pr.GetUpdatedAt().Time,
 			}
+			activitiesMap.Store(key, &activity)
 		}
+	}
 
-		if config.debugMode && totalFound > 0 {
-			fmt.Printf("  [%s] Complete: %d PRs found\n", label, totalFound)
+	// Load Issues
+	allIssues, issueLabels, err := config.db.GetAllIssuesWithLabels(config.debugMode)
+	if err != nil {
+		if config.debugMode {
+			fmt.Printf("  [DB] Error loading issues from database: %v\n", err)
 		}
-
 		return
 	}
+	if config.debugMode {
+		fmt.Println("  [DB] Loading issues from database...")
+	}
+	for key, issue := range allIssues {
+		if issue.GetUpdatedAt().Time.Before(cutoffTime) {
+			continue
+		}
+
+		parts := strings.Split(key, "/")
+		if len(parts) < 2 {
+			continue
+		}
+		owner := parts[0]
+		repoAndNum := parts[1]
+		repoParts := strings.Split(repoAndNum, "#")
+		if len(repoParts) < 2 {
+			continue
+		}
+		repo := repoParts[0]
+
+		if !isRepoAllowed(owner, repo) {
+			continue
+		}
+
+		storedLabel := issueLabels[key]
+		if storedLabel == "" {
+			storedLabel = "Involved"
+		}
+
+		activity := IssueActivity{
+			Label:     storedLabel,
+			Owner:     owner,
+			Repo:      repo,
+			Issue:     issue,
+			UpdatedAt: issue.GetUpdatedAt().Time,
+		}
+		issueActivitiesMap.Store(key, &activity)
+	}
+
+	if config.debugMode {
+		prCount := 0
+		activitiesMap.Range(func(_, _ interface{}) bool { prCount++; return true })
+		issCount := 0
+		issueActivitiesMap.Range(func(_, _ interface{}) bool { issCount++; return true })
+		fmt.Printf("  [DB] Loaded %d PRs and %d issues from DB\n", prCount, issCount)
+	}
+}
+
+// findMaxUpdated scans the activity maps (populated from DB or searches)
+// and returns the most recent UpdatedAt time seen. Used to tighten
+// search windows for incremental fetches.
+func findMaxUpdated(prMap, issueMap *sync.Map) time.Time {
+	var max time.Time
+	prMap.Range(func(_, v interface{}) bool {
+		if act, ok := v.(*PRActivity); ok {
+			if act.UpdatedAt.After(max) {
+				max = act.UpdatedAt
+			}
+		}
+		return true
+	})
+	issueMap.Range(func(_, v interface{}) bool {
+		if act, ok := v.(*IssueActivity); ok {
+			if act.UpdatedAt.After(max) {
+				max = act.UpdatedAt
+			}
+		}
+		return true
+	})
+	return max
+}
+
+func collectSearchResults(query, label string, seenPRs *sync.Map, activitiesMap *sync.Map) {
+	// Local loading is handled once at the top level in fetchAndDisplayActivity via loadAllFromDB.
+	// The per-query local path is no longer used.
 
 	opts := &github.SearchOptions{
 		ListOptions: github.ListOptions{PerPage: 100},
@@ -1254,8 +1382,11 @@ func collectSearchResults(query, label string, seenPRs *sync.Map, activitiesMap 
 					Body:      issue.Body,
 					State:     issue.State,
 					UpdatedAt: issue.UpdatedAt,
+					CreatedAt: issue.CreatedAt,
+					ClosedAt:  issue.ClosedAt,
 					User:      issue.User,
 					HTMLURL:   issue.HTMLURL,
+					Draft:     issue.Draft,
 				}
 				// }
 
@@ -1426,91 +1557,8 @@ func displayIssue(label, owner, repo string, issue *github.Issue, indented bool,
 }
 
 func collectIssueSearchResults(query, label string, seenIssues *sync.Map, issueActivitiesMap *sync.Map) {
-	if config.localMode {
-		if config.db == nil {
-			return
-		}
-
-		allIssues, issueLabels, err := config.db.GetAllIssuesWithLabels(config.debugMode)
-		if err != nil {
-			if config.debugMode {
-				fmt.Printf("  [%s] Error loading from database: %v\n", label, err)
-			}
-			return
-		}
-
-		if config.debugMode {
-			fmt.Printf("  [%s] Loading from database...\n", label)
-		}
-
-		totalFound := 0
-		cutoffTime := time.Now().Add(-config.timeRange)
-		for key, issue := range allIssues {
-			storedLabel := issueLabels[key]
-
-			if storedLabel != label {
-				continue
-			}
-
-			if issue.GetUpdatedAt().Time.Before(cutoffTime) {
-				continue
-			}
-
-			parts := strings.Split(key, "/")
-			if len(parts) < 2 {
-				continue
-			}
-			owner := parts[0]
-			repoAndNum := parts[1]
-			repoParts := strings.Split(repoAndNum, "#")
-			if len(repoParts) < 2 {
-				continue
-			}
-			repo := repoParts[0]
-
-			if !isRepoAllowed(owner, repo) {
-				continue
-			}
-
-			issueKey := key
-
-			// Check if we've already processed this issue in issueActivitiesMap
-			existingActivity, alreadyProcessed := issueActivitiesMap.Load(issueKey)
-			shouldProcess := true
-
-			if alreadyProcessed {
-				// Issue is already in issueActivitiesMap, check if we need to update the label
-				existingIssue := existingActivity.(*IssueActivity)
-				if shouldUpdateLabel(existingIssue.Label, label, false) {
-					// New label has higher priority, we'll update it
-					if config.debugMode {
-						fmt.Printf("  [%s] Updating label for %s from %s to %s (higher priority)\n", label, issueKey, existingIssue.Label, label)
-					}
-				} else {
-					// Existing label has higher or equal priority, skip
-					shouldProcess = false
-				}
-			}
-
-			if shouldProcess {
-				activity := IssueActivity{
-					Label:     label,
-					Owner:     owner,
-					Repo:      repo,
-					Issue:     issue,
-					UpdatedAt: issue.GetUpdatedAt().Time,
-				}
-				issueActivitiesMap.Store(issueKey, &activity)
-				totalFound++
-			}
-		}
-
-		if config.debugMode && totalFound > 0 {
-			fmt.Printf("  [%s] Complete: %d issues found\n", label, totalFound)
-		}
-
-		return
-	}
+	// Local loading is handled once at the top level in fetchAndDisplayActivity via loadAllFromDB.
+	// The per-query local path is no longer used.
 
 	opts := &github.SearchOptions{
 		ListOptions: github.ListOptions{PerPage: 100},

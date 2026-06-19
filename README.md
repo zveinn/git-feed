@@ -192,16 +192,15 @@ github-feed --local --time 2w --debug --links --allowed-repos="miniohq/ec,tunnel
 
 ### Online Mode (Default)
 
-1. **Parallel Fetching** - Simultaneously searches for:
-   - PRs you authored
-   - PRs where you're mentioned
-   - PRs assigned to you
-   - PRs you commented on
-   - PRs you reviewed
-   - PRs requesting your review
-   - PRs involving you
-   - Your recent activity events
-   - Issues you authored/mentioned/assigned/commented
+1. **Parallel Fetching** (optimized) - Uses 8 GitHub Search queries (down from 10):
+   - PRs you reviewed (`reviewed-by`)
+   - PRs requesting your review (`review-requested`)
+   - PRs you authored (`author`)
+   - PRs assigned to you (`assignee`)
+   - PRs where you are otherwise involved (`involves` — covers commented + mentioned)
+   - Same for issues (authored, assigned, and broad `involves`)
+   - Weak roles (commented/mentioned only) surface with the "Involved" label
+   - High-value labels (Authored / Assigned / Reviewed / Review Requested) are preserved when possible
 
 2. **Local Caching** - All fetched data is automatically saved to a local BBolt database (`~/.github-feed/github.db`)
    - PRs, issues, and comments are cached for offline access
