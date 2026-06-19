@@ -864,14 +864,10 @@ func fetchAndDisplayActivity() {
 		return standaloneIssues[i].UpdatedAt.After(standaloneIssues[j].UpdatedAt)
 	})
 
-	var openPRs, closedPRs, mergedPRs []PRActivity
+	var openPRs, closedPRs []PRActivity
 	for _, activity := range activities {
 		if activity.PR.State != nil && *activity.PR.State == "closed" {
-			if activity.PR.Merged != nil && *activity.PR.Merged {
-				mergedPRs = append(mergedPRs, activity)
-			} else {
-				closedPRs = append(closedPRs, activity)
-			}
+			closedPRs = append(closedPRs, activity)
 		} else {
 			openPRs = append(openPRs, activity)
 		}
